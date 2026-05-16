@@ -66,10 +66,15 @@ defmodule Mix.Tasks.Workspace.PostIssueLedger do
       end
 
     graphify_operation =
-      if opts[:skip_graphify] do
-        skipped_operation("graphify_update", "disabled by --skip-graphify")
-      else
-        graphify_operation(repo_path, timeout_ms(opts[:graphify_timeout_ms], @default_graphify_timeout_ms))
+      cond do
+        opts[:skip_graphify] ->
+          skipped_operation("graphify_update", "disabled by --skip-graphify")
+
+        repo_sync_failed?(git_operation) ->
+          skipped_operation("graphify_update", "repo sync failed; graphify skipped to avoid stale graph")
+
+        true ->
+          graphify_operation(repo_path, timeout_ms(opts[:graphify_timeout_ms], @default_graphify_timeout_ms))
       end
 
     ledger = %{
@@ -86,10 +91,12 @@ defmodule Mix.Tasks.Workspace.PostIssueLedger do
       },
       "next_step_hints" => %{
         "authorization" => "read_only",
-        "notes" => [
-          "Parent Codex may read this ledger for queue preview.",
-          "This ledger does not authorize the next issue."
-        ]
+        "notes" =>
+          [
+            "Parent Codex may read this ledger for queue preview.",
+            "This ledger does not authorize the next issue."
+          ]
+          |> maybe_add_repo_sync_note(git_operation)
       },
       "boundaries" => [
         "does_not_authorize_next_issue",
@@ -135,6 +142,17 @@ defmodule Mix.Tasks.Workspace.PostIssueLedger do
 
       true ->
         run_operation("graphify_update", "graphify", ["update", "."], repo_path, timeout_ms)
+    end
+  end
+
+  defp repo_sync_failed?(%{"status" => status}) when status in ["failed", "timeout"], do: true
+  defp repo_sync_failed?(_operation), do: false
+
+  defp maybe_add_repo_sync_note(notes, git_operation) do
+    if repo_sync_failed?(git_operation) do
+      notes ++ ["Repository sync did not pass; Graphify update was skipped to avoid a stale resource graph."]
+    else
+      notes
     end
   end
 
