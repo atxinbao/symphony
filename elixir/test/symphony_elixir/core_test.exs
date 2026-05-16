@@ -675,7 +675,16 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(state.running, issue_id)
     refute MapSet.member?(state.claimed, issue_id)
     assert MapSet.member?(state.completed, issue_id)
-    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert %{delay_type: :terminal_followup, retry_token: retry_token} = state.retry_attempts[issue_id]
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{id: issue_id, identifier: issue_identifier, title: "Done issue", state: "Done"}
+    ])
+
+    send(pid, {:retry_issue, issue_id, retry_token})
+    Process.sleep(50)
+
+    refute File.exists?(workspace)
   end
 
   test "normal worker exit uses host-side handoff fallback when marker is missing" do
@@ -796,7 +805,7 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(state.running, issue_id)
     refute MapSet.member?(state.claimed, issue_id)
     assert MapSet.member?(state.completed, issue_id)
-    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert %{delay_type: :terminal_followup} = state.retry_attempts[issue_id]
   end
 
   test "abnormal worker exit increments retry attempt progressively" do

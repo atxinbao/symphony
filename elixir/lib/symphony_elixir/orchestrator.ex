@@ -843,6 +843,7 @@ defmodule SymphonyElixir.Orchestrator do
             state
             |> complete_issue(issue_id)
             |> release_issue_claim(issue_id)
+            |> schedule_terminal_followup(issue_id, running_entry)
 
           {:error, reason} ->
             Logger.warning("Issue handoff marker accepted but failed to move issue_id=#{issue_id} to #{@in_review_state}: #{inspect(reason)}")
@@ -942,6 +943,19 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp schedule_terminal_followup(%State{} = state, issue_id, running_entry)
+       when is_binary(issue_id) and is_map(running_entry) do
+    schedule_issue_retry(state, issue_id, 1, %{
+      identifier: Map.get(running_entry, :identifier),
+      delay_type: :terminal_followup,
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      error: "waiting for terminal state after handoff"
+    })
+  end
+
+  defp schedule_terminal_followup(%State{} = state, _issue_id, _running_entry), do: state
+
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
@@ -954,6 +968,7 @@ defmodule SymphonyElixir.Orchestrator do
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    delay_type = pick_retry_delay_type(previous_retry, metadata)
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -975,6 +990,7 @@ defmodule SymphonyElixir.Orchestrator do
             due_at_ms: due_at_ms,
             identifier: identifier,
             error: error,
+            delay_type: delay_type,
             worker_host: worker_host,
             workspace_path: workspace_path
           })
@@ -987,6 +1003,7 @@ defmodule SymphonyElixir.Orchestrator do
         metadata = %{
           identifier: Map.get(retry_entry, :identifier),
           error: Map.get(retry_entry, :error),
+          delay_type: Map.get(retry_entry, :delay_type),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path)
         }
@@ -995,6 +1012,26 @@ defmodule SymphonyElixir.Orchestrator do
 
       _ ->
         :missing
+    end
+  end
+
+  defp handle_retry_issue(%State{} = state, issue_id, attempt, %{delay_type: :terminal_followup} = metadata) do
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
+      {:ok, issues} ->
+        issues
+        |> find_issue_by_id(issue_id)
+        |> handle_terminal_followup_lookup(state, issue_id, attempt, metadata)
+
+      {:error, reason} ->
+        Logger.warning("Terminal follow-up poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue_id,
+           attempt + 1,
+           Map.merge(metadata, %{error: "terminal follow-up poll failed: #{inspect(reason)}"})
+         )}
     end
   end
 
@@ -1040,6 +1077,36 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_retry_issue_lookup(nil, state, issue_id, _attempt, _metadata) do
     Logger.debug("Issue no longer visible, removing claim issue_id=#{issue_id}")
+    {:noreply, release_issue_claim(state, issue_id)}
+  end
+
+  defp handle_terminal_followup_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
+    terminal_states = terminal_state_set()
+
+    if terminal_issue_state?(issue.state, terminal_states) do
+      Logger.info("Issue state is terminal after handoff: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
+
+      cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
+      {:noreply, release_issue_claim(state, issue_id)}
+    else
+      Logger.debug("Issue waiting for terminal state after handoff: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}")
+
+      {:noreply,
+       schedule_issue_retry(
+         state,
+         issue_id,
+         attempt + 1,
+         Map.merge(metadata, %{
+           identifier: issue.identifier,
+           delay_type: :terminal_followup,
+           error: "waiting for terminal state after handoff"
+         })
+       )}
+    end
+  end
+
+  defp handle_terminal_followup_lookup(nil, state, issue_id, _attempt, _metadata) do
+    Logger.debug("Issue no longer visible during terminal follow-up, removing claim issue_id=#{issue_id}")
     {:noreply, release_issue_claim(state, issue_id)}
   end
 
@@ -1101,10 +1168,15 @@ defmodule SymphonyElixir.Orchestrator do
   defp next_retry_attempt(_attempt), do: 1
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
-    else
-      failure_retry_delay(attempt)
+    cond do
+      metadata[:delay_type] in [:continuation, :terminal_followup] and attempt == 1 ->
+        @continuation_retry_delay_ms
+
+      metadata[:delay_type] == :terminal_followup ->
+        Config.settings!().polling.interval_ms
+
+      true ->
+        failure_retry_delay(attempt)
     end
   end
 
@@ -1137,6 +1209,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pick_retry_workspace_path(previous_retry, metadata) do
     metadata[:workspace_path] || Map.get(previous_retry, :workspace_path)
+  end
+
+  defp pick_retry_delay_type(previous_retry, metadata) do
+    metadata[:delay_type] || Map.get(previous_retry, :delay_type)
   end
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
