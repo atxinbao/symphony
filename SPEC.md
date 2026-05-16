@@ -707,12 +707,21 @@ Tick sequence:
 1. Reconcile running issues.
 2. Run dispatch preflight validation.
 3. Fetch candidate issues from tracker using active states.
-4. Sort issues by dispatch priority.
-5. Dispatch eligible issues while slots remain.
-6. Notify observability/status consumers of state changes.
+4. Check queue integrity.
+5. Sort issues by dispatch priority.
+6. Dispatch eligible issues while slots remain.
+7. Notify observability/status consumers of state changes.
 
 If per-tick validation fails, dispatch is skipped for that tick, but reconciliation still happens
 first.
+
+Queue integrity:
+
+- If more than one valid active issue is visible for the configured project, dispatch is skipped for
+  that tick and the service logs a queue integrity error.
+- Active states include the configured `tracker.active_states`, such as `Todo` and `In Progress`.
+- This keeps WIP=1 per configured project while still allowing separate Symphony processes to handle
+  separate projects concurrently.
 
 ### 8.2 Candidate Selection Rules
 
@@ -1979,6 +1988,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
 - Dispatch sort order is priority then oldest creation time
+- Multiple visible active issues stop dispatch for that tick with a queue integrity error
 - `Todo` issue with non-terminal blockers is not eligible
 - `Todo` issue with terminal blockers is eligible
 - Active-state issue refresh updates running entry state
