@@ -488,6 +488,33 @@ defmodule SymphonyElixir.CoreTest do
     assert_receive {:memory_tracker_state_update, "issue-prepare", "In Progress"}
   end
 
+  test "queue integrity rejects multiple active issues" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress"]
+    )
+
+    issues = [
+      %Issue{id: "issue-a", identifier: "MT-570", state: "Todo", title: "First Todo"},
+      %Issue{id: "issue-b", identifier: "MT-571", state: "In Progress", title: "Active work"}
+    ]
+
+    assert {:error, {:multiple_active_issues, ["MT-570", "MT-571"]}} =
+             Orchestrator.queue_integrity_for_test(issues)
+  end
+
+  test "queue integrity allows exactly one active issue" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress"]
+    )
+
+    issues = [
+      %Issue{id: "issue-a", identifier: "MT-572", state: "In Progress", title: "Active work"},
+      %Issue{id: "issue-b", identifier: "MT-573", state: "Backlog", title: "Queued work"}
+    ]
+
+    assert :ok = Orchestrator.queue_integrity_for_test(issues)
+  end
+
   test "reconcile stops running issue when it is reassigned away from this worker" do
     issue_id = "issue-reassigned"
 

@@ -325,6 +325,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec queue_integrity_for_test([Issue.t()]) :: :ok | {:error, {:multiple_active_issues, [String.t()]}}
+  def queue_integrity_for_test(issues) when is_list(issues) do
+    queue_integrity(issues, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
   @spec prepare_issue_for_dispatch_for_test(Issue.t()) ::
           {:ok, Issue.t()} | {:error, term()}
   def prepare_issue_for_dispatch_for_test(%Issue{} = issue) do
@@ -530,15 +536,22 @@ defmodule SymphonyElixir.Orchestrator do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
 
-    issues
-    |> sort_issues_for_dispatch()
-    |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue)
-      else
-        state_acc
-      end
-    end)
+    case queue_integrity(issues, active_states, terminal_states) do
+      :ok ->
+        issues
+        |> sort_issues_for_dispatch()
+        |> Enum.reduce(state, fn issue, state_acc ->
+          if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
+            dispatch_issue(state_acc, issue)
+          else
+            state_acc
+          end
+        end)
+
+      {:error, {:multiple_active_issues, identifiers}} ->
+        Logger.error("Queue integrity error: multiple active issues visible; stopping dispatch identifiers=#{inspect(identifiers)}")
+        state
+    end
   end
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
@@ -615,6 +628,27 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
+
+  defp queue_integrity(issues, active_states, terminal_states) when is_list(issues) do
+    active_identifiers =
+      issues
+      |> Enum.filter(&candidate_issue?(&1, active_states, terminal_states))
+      |> Enum.map(&issue_identifier_for_error/1)
+
+    case active_identifiers do
+      [] -> :ok
+      [_identifier] -> :ok
+      identifiers -> {:error, {:multiple_active_issues, identifiers}}
+    end
+  end
+
+  defp queue_integrity(_issues, _active_states, _terminal_states), do: :ok
+
+  defp issue_identifier_for_error(%Issue{identifier: identifier}) when is_binary(identifier) and identifier != "",
+    do: identifier
+
+  defp issue_identifier_for_error(%Issue{id: id}) when is_binary(id), do: id
+  defp issue_identifier_for_error(_issue), do: "unknown"
 
   defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
        when is_boolean(assigned_to_worker),
