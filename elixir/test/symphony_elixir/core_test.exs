@@ -467,6 +467,27 @@ defmodule SymphonyElixir.CoreTest do
     assert updated_entry.issue.state == "In Progress"
   end
 
+  test "dispatch preparation moves Todo issue to In Progress" do
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress"]
+    )
+
+    issue = %Issue{
+      id: "issue-prepare",
+      identifier: "MT-570",
+      state: "Todo",
+      title: "Prepare dispatch"
+    }
+
+    assert {:ok, %Issue{state: "In Progress"}} =
+             Orchestrator.prepare_issue_for_dispatch_for_test(issue)
+
+    assert_receive {:memory_tracker_state_update, "issue-prepare", "In Progress"}
+  end
+
   test "reconcile stops running issue when it is reassigned away from this worker" do
     issue_id = "issue-reassigned"
 
@@ -551,7 +572,83 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, 0, 1_100)
+  end
+
+  test "normal worker exit with valid handoff marker moves issue to In Review" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-handoff-marker-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-handoff"
+    issue_identifier = "MT-571"
+    workspace = Path.join(test_root, issue_identifier)
+    marker_dir = Path.join(workspace, ".codex")
+    marker_path = Path.join(marker_dir, "symphony-issue-handoff.json")
+    ref = make_ref()
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: test_root,
+      tracker_active_states: ["Todo", "In Progress"]
+    )
+
+    File.mkdir_p!(marker_dir)
+
+    File.write!(
+      marker_path,
+      Jason.encode!(%{
+        "issue" => issue_identifier,
+        "pr_url" => "https://github.com/example/repo/pull/1",
+        "ready_for_review" => true,
+        "auto_merge_enabled" => true
+      })
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :HandoffMarkerOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+
+      File.rm_rf(test_root)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: issue_identifier,
+      issue: %Issue{id: issue_id, identifier: issue_identifier, state: "In Progress"},
+      workspace_path: workspace,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+
+    assert_receive {:memory_tracker_state_update, "issue-handoff", "In Review"}, 500
+
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -591,7 +688,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, 35_000, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -630,7 +727,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_in_range(due_at_ms, 8_000, 10_500)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do

@@ -12,6 +12,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @todo_state "Todo"
+  @in_progress_state "In Progress"
+  @in_review_state "In Review"
+  @handoff_marker_path ".codex/symphony-issue-handoff.json"
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -132,16 +136,9 @@ defmodule SymphonyElixir.Orchestrator do
         state =
           case reason do
             :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; checking handoff marker")
 
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+              handle_normal_worker_exit(state, issue_id, running_entry)
 
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
@@ -325,6 +322,19 @@ defmodule SymphonyElixir.Orchestrator do
   @spec sort_issues_for_dispatch_for_test([Issue.t()]) :: [Issue.t()]
   def sort_issues_for_dispatch_for_test(issues) when is_list(issues) do
     sort_issues_for_dispatch(issues)
+  end
+
+  @doc false
+  @spec prepare_issue_for_dispatch_for_test(Issue.t()) ::
+          {:ok, Issue.t()} | {:error, term()}
+  def prepare_issue_for_dispatch_for_test(%Issue{} = issue) do
+    prepare_issue_for_dispatch(issue)
+  end
+
+  @doc false
+  @spec handoff_marker_for_test(map()) :: {:ready, map()} | {:continue, term()}
+  def handoff_marker_for_test(running_entry) when is_map(running_entry) do
+    handoff_marker(running_entry)
   end
 
   @doc false
@@ -660,7 +670,19 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        case prepare_issue_for_dispatch(refreshed_issue) do
+          {:ok, dispatch_issue} ->
+            do_dispatch_issue(state, dispatch_issue, attempt, preferred_worker_host)
+
+          {:error, reason} ->
+            Logger.warning("Skipping dispatch; failed to prepare issue #{issue_context(refreshed_issue)}: #{inspect(reason)}")
+
+            schedule_issue_retry(state, refreshed_issue.id, next_retry_attempt(attempt), %{
+              identifier: refreshed_issue.identifier,
+              error: "failed to prepare issue for dispatch: #{inspect(reason)}",
+              worker_host: preferred_worker_host
+            })
+        end
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
@@ -761,6 +783,107 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
+
+  defp prepare_issue_for_dispatch(%Issue{state: state_name} = issue) do
+    if normalize_issue_state(state_name) == normalize_issue_state(@todo_state) do
+      case Tracker.update_issue_state(issue.id, @in_progress_state) do
+        :ok ->
+          Logger.info("Issue moved to #{@in_progress_state} before dispatch: #{issue_context(issue)}")
+          {:ok, %Issue{issue | state: @in_progress_state}}
+
+        {:error, reason} ->
+          {:error, {:state_update_failed, @in_progress_state, reason}}
+      end
+    else
+      {:ok, issue}
+    end
+  end
+
+  defp handle_normal_worker_exit(%State{} = state, issue_id, running_entry) do
+    case handoff_marker(running_entry) do
+      {:ready, marker} ->
+        case Tracker.update_issue_state(issue_id, @in_review_state) do
+          :ok ->
+            Logger.info("Issue handoff marker accepted; moved to #{@in_review_state}: issue_id=#{issue_id} pr_url=#{inspect(marker["pr_url"])}")
+
+            state
+            |> complete_issue(issue_id)
+            |> release_issue_claim(issue_id)
+
+          {:error, reason} ->
+            Logger.warning("Issue handoff marker accepted but failed to move issue_id=#{issue_id} to #{@in_review_state}: #{inspect(reason)}")
+
+            schedule_issue_retry(state, issue_id, 1, %{
+              identifier: running_entry.identifier,
+              error: "failed to move issue to #{@in_review_state}: #{inspect(reason)}",
+              worker_host: Map.get(running_entry, :worker_host),
+              workspace_path: Map.get(running_entry, :workspace_path)
+            })
+        end
+
+      {:continue, reason} ->
+        Logger.info("No completed issue handoff for issue_id=#{issue_id}; scheduling active-state continuation check reason=#{inspect(reason)}")
+
+        state
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(issue_id, 1, %{
+          identifier: running_entry.identifier,
+          delay_type: :continuation,
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
+    end
+  end
+
+  defp handoff_marker(running_entry) when is_map(running_entry) do
+    case Map.get(running_entry, :workspace_path) do
+      workspace_path when is_binary(workspace_path) ->
+        workspace_path
+        |> Path.join(@handoff_marker_path)
+        |> read_handoff_marker()
+
+      _ ->
+        {:continue, :missing_workspace_path}
+    end
+  end
+
+  defp handoff_marker(_running_entry), do: {:continue, :missing_running_entry}
+
+  defp read_handoff_marker(marker_path) do
+    if File.regular?(marker_path) do
+      with {:ok, content} <- File.read(marker_path),
+           {:ok, marker} <- Jason.decode(content),
+           :ok <- validate_handoff_marker(marker) do
+        {:ready, marker}
+      else
+        {:error, reason} -> {:continue, {:invalid_handoff_marker, reason}}
+        reason -> {:continue, {:invalid_handoff_marker, reason}}
+      end
+    else
+      {:continue, :missing_handoff_marker}
+    end
+  end
+
+  defp validate_handoff_marker(%{} = marker) do
+    cond do
+      marker["ready_for_review"] != true ->
+        {:error, :ready_for_review_not_confirmed}
+
+      marker["auto_merge_enabled"] != true ->
+        {:error, :auto_merge_not_confirmed}
+
+      !present_string?(marker["pr_url"]) ->
+        {:error, :missing_pr_url}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_handoff_marker(_marker), do: {:error, :handoff_marker_not_an_object}
+
+  defp present_string?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present_string?(_value), do: false
 
   defp complete_issue(%State{} = state, issue_id) do
     %{
@@ -924,6 +1047,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp release_issue_claim(%State{} = state, issue_id) do
     %{state | claimed: MapSet.delete(state.claimed, issue_id)}
   end
+
+  defp next_retry_attempt(attempt) when is_integer(attempt), do: attempt + 1
+  defp next_retry_attempt(_attempt), do: 1
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     if metadata[:delay_type] == :continuation and attempt == 1 do
