@@ -127,6 +127,59 @@ defmodule Mix.Tasks.Workspace.PostIssueLedgerTest do
     end)
   end
 
+  test "skips graphify update when repo sync fails" do
+    with_fake_binaries(
+      %{
+        "git" => """
+        #!/bin/sh
+        printf '%s\\n' "$*" >> "$LEDGER_COMMAND_LOG"
+        if [ "$1" = "pull" ]; then
+          printf 'network unavailable\\n'
+          exit 42
+        fi
+        exit 99
+        """,
+        "graphify" => """
+        #!/bin/sh
+        printf '%s\\n' "$*" >> "$LEDGER_COMMAND_LOG"
+        printf 'graph should not run\\n'
+        exit 0
+        """
+      },
+      fn root, log_path ->
+        repo_path = Path.join(root, "repo")
+        output_path = Path.join(root, "ledger/latest.json")
+        File.mkdir_p!(Path.join(repo_path, ".git"))
+
+        capture_io(fn ->
+          PostIssueLedger.run([
+            "--repo-path",
+            repo_path,
+            "--output",
+            output_path,
+            "--issue",
+            "MTP-15"
+          ])
+        end)
+
+        ledger =
+          output_path
+          |> File.read!()
+          |> Jason.decode!()
+
+        operations = Map.new(ledger["operations"], &{&1["name"], &1})
+        assert operations["git_pull_ff_only"]["status"] == "failed"
+        assert operations["graphify_update"]["status"] == "skipped"
+        assert operations["graphify_update"]["reason"] =~ "repo sync failed"
+        assert Enum.any?(ledger["next_step_hints"]["notes"], &String.contains?(&1, "Repository sync did not pass"))
+
+        command_log = File.read!(log_path)
+        assert command_log =~ "pull --ff-only origin main"
+        refute command_log =~ "update ."
+      end
+    )
+  end
+
   defp with_fake_binaries(scripts, fun) do
     root = Path.join(System.tmp_dir!(), "post-issue-ledger-test-#{System.unique_integer([:positive])}")
     bin_dir = Path.join(root, "bin")
