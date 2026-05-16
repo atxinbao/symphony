@@ -26,6 +26,11 @@ skills can make raw Linear GraphQL calls.
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
+Projects that need a structured host-side "after the work is done" record can call
+`mix workspace.post_issue_ledger` from a `before_remove` hook. The task writes a JSON summary with
+git pull, Graphify update, read-only next-step hints, and boundary fields without authorizing the
+next issue.
+
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see

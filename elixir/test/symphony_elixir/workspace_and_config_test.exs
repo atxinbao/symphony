@@ -610,22 +610,24 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "echo after_create > after_create.log\necho call >> \"#{after_create_counter}\"",
-        hook_before_remove: "echo before_remove > \"#{before_remove_marker}\""
+        hook_after_create: "printf '%s %s %s' \"$SYMPHONY_HOOK_NAME\" \"$SYMPHONY_ISSUE_IDENTIFIER\" \"$SYMPHONY_WORKSPACE\" > after_create.log\necho call >> \"#{after_create_counter}\"",
+        hook_before_remove: "printf '%s %s %s' \"$SYMPHONY_HOOK_NAME\" \"$SYMPHONY_ISSUE_IDENTIFIER\" \"$SYMPHONY_WORKSPACE\" > \"#{before_remove_marker}\""
       )
 
       config = Config.settings!()
-      assert config.hooks.after_create =~ "echo after_create > after_create.log"
-      assert config.hooks.before_remove =~ "echo before_remove >"
+      assert config.hooks.after_create =~ "SYMPHONY_HOOK_NAME"
+      assert config.hooks.before_remove =~ "SYMPHONY_ISSUE_IDENTIFIER"
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS")
-      assert File.read!(Path.join(workspace, "after_create.log")) == "after_create\n"
+
+      assert File.read!(Path.join(workspace, "after_create.log")) ==
+               "after_create MT-HOOKS #{workspace}"
 
       assert {:ok, _workspace} = Workspace.create_for_issue("MT-HOOKS")
       assert length(String.split(String.trim(File.read!(after_create_counter)), "\n")) == 1
 
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS")
-      assert File.read!(before_remove_marker) == "before_remove\n"
+      assert File.read!(before_remove_marker) == "before_remove MT-HOOKS #{workspace}"
       refute File.exists?(workspace)
     after
       File.rm_rf(test_root)
