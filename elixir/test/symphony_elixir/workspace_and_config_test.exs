@@ -1203,6 +1203,22 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert blank_workspace_policy == default_policy
 
+      issue_workspace_policy_settings = %{
+        settings
+        | codex: %{settings.codex | turn_sandbox_policy: %{"type" => "workspaceWrite"}}
+      }
+
+      assert {:ok, issue_workspace_policy} =
+               Schema.resolve_runtime_turn_sandbox_policy(issue_workspace_policy_settings, issue_workspace)
+
+      assert {:ok, canonical_issue_workspace} =
+               SymphonyElixir.PathSafety.canonicalize(issue_workspace)
+
+      assert issue_workspace_policy["type"] == "workspaceWrite"
+      assert issue_workspace_policy["writableRoots"] == [canonical_issue_workspace]
+      assert issue_workspace_policy["readOnlyAccess"] == %{"type" => "fullAccess"}
+      assert issue_workspace_policy["networkAccess"] == false
+
       read_only_settings = %{
         settings
         | codex: %{settings.codex | turn_sandbox_policy: %{"type" => "readOnly", "networkAccess" => true}}

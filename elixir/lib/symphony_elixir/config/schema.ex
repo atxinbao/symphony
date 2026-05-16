@@ -308,7 +308,7 @@ defmodule SymphonyElixir.Config.Schema do
   def resolve_runtime_turn_sandbox_policy(settings, workspace \\ nil, opts \\ []) do
     case settings.codex.turn_sandbox_policy do
       %{} = policy ->
-        {:ok, policy}
+        resolve_explicit_runtime_turn_sandbox_policy(policy, settings, workspace, opts)
 
       _ ->
         workspace
@@ -488,6 +488,25 @@ defmodule SymphonyElixir.Config.Schema do
       "excludeTmpdirEnvVar" => false,
       "excludeSlashTmp" => false
     }
+  end
+
+  defp resolve_explicit_runtime_turn_sandbox_policy(%{"type" => "workspaceWrite"} = policy, settings, workspace, opts) do
+    case Map.get(policy, "writableRoots") do
+      roots when is_list(roots) and roots != [] ->
+        {:ok, policy}
+
+      _ ->
+        with {:ok, default_policy} <-
+               workspace
+               |> default_workspace_root(settings.workspace.root)
+               |> default_runtime_turn_sandbox_policy(opts) do
+          {:ok, Map.merge(default_policy, policy)}
+        end
+    end
+  end
+
+  defp resolve_explicit_runtime_turn_sandbox_policy(policy, _settings, _workspace, _opts) do
+    {:ok, policy}
   end
 
   defp default_runtime_turn_sandbox_policy(workspace_root, opts) when is_binary(workspace_root) do

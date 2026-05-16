@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, HostHandoffFallback, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -834,7 +834,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_normal_worker_exit(%State{} = state, issue_id, running_entry) do
-    case handoff_marker(running_entry) do
+    case handoff_marker_or_host_fallback(running_entry) do
       {:ready, marker} ->
         case Tracker.update_issue_state(issue_id, @in_review_state) do
           :ok ->
@@ -882,6 +882,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handoff_marker(_running_entry), do: {:continue, :missing_running_entry}
+
+  defp handoff_marker_or_host_fallback(running_entry) do
+    case handoff_marker(running_entry) do
+      {:ready, marker} ->
+        {:ready, marker}
+
+      {:continue, reason} ->
+        Logger.info("No valid child handoff marker; trying host-side handoff fallback reason=#{inspect(reason)}")
+
+        case HostHandoffFallback.run(running_entry) do
+          {:ready, marker} -> {:ready, marker}
+          {:continue, fallback_reason} -> {:continue, {reason, fallback_reason}}
+        end
+    end
+  end
 
   defp read_handoff_marker(marker_path) do
     if File.regular?(marker_path) do

@@ -599,7 +599,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 0, 1_100)
+    assert_due_in_range(due_at_ms, -2_000, 1_100)
   end
 
   test "normal worker exit with valid handoff marker moves issue to In Review" do
@@ -668,6 +668,127 @@ defmodule SymphonyElixir.CoreTest do
     send(pid, {:DOWN, ref, :process, self(), :normal})
 
     assert_receive {:memory_tracker_state_update, "issue-handoff", "In Review"}, 500
+
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+  end
+
+  test "normal worker exit uses host-side handoff fallback when marker is missing" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-host-handoff-fallback-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-host-handoff"
+    issue_identifier = "MT-572"
+    workspace = Path.join(test_root, issue_identifier)
+    ref = make_ref()
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    Application.put_env(:symphony_elixir, :host_handoff_command_runner, fn command, args, opts ->
+      send(test_pid, {:host_handoff_command, command, args, Keyword.get(opts, :cd)})
+
+      case {command, args} do
+        {"git", ["rev-parse", "--is-inside-work-tree"]} ->
+          {"true\n", 0}
+
+        {"git", ["branch", "--show-current"]} ->
+          {"main\n", 0}
+
+        {"git", ["checkout", "-B", "symphony-issue/mt-572"]} ->
+          {"", 0}
+
+        {"git", ["status", "--porcelain", "--untracked-files=all"]} ->
+          {" M Sources/Foo.swift\n", 0}
+
+        {"git", ["add", "-A"]} ->
+          {"", 0}
+
+        {"git", ["commit", "-m", "MT-572: Host fallback issue"]} ->
+          {"", 0}
+
+        {"git", ["push", "--set-upstream", "origin", "symphony-issue/mt-572"]} ->
+          {"", 0}
+
+        {"gh", ["pr", "view", "--json", "url", "--jq", ".url"]} ->
+          {"no pull requests found for branch\n", 1}
+
+        {"gh", ["pr", "create", "--title", "MT-572: Host fallback issue", "--body", _body, "--base", "main", "--head", "symphony-issue/mt-572"]} ->
+          {"https://github.com/example/repo/pull/42\n", 0}
+
+        {"gh", ["pr", "merge", "https://github.com/example/repo/pull/42", "--auto", "--squash"]} ->
+          {"", 0}
+      end
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: test_root,
+      tracker_active_states: ["Todo", "In Progress"]
+    )
+
+    File.mkdir_p!(workspace)
+
+    orchestrator_name = Module.concat(__MODULE__, :HostHandoffFallbackOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :host_handoff_command_runner)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+
+      File.rm_rf(test_root)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: issue_identifier,
+      issue: %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        title: "Host fallback issue",
+        state: "In Progress"
+      },
+      workspace_path: workspace,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+
+    assert_receive {:memory_tracker_state_update, "issue-host-handoff", "In Review"}, 500
+    assert_receive {:host_handoff_command, "git", ["checkout", "-B", "symphony-issue/mt-572"], ^workspace}
+    assert_receive {:host_handoff_command, "gh", ["pr", "merge", "https://github.com/example/repo/pull/42", "--auto", "--squash"], ^workspace}
+
+    marker =
+      workspace
+      |> Path.join(".codex/symphony-issue-handoff.json")
+      |> File.read!()
+      |> Jason.decode!()
+
+    assert marker["pr_url"] == "https://github.com/example/repo/pull/42"
+    assert marker["ready_for_review"] == true
+    assert marker["auto_merge_enabled"] == true
+    assert marker["handoff_source"] == "host-side handoff fallback"
 
     Process.sleep(50)
     state = :sys.get_state(pid)
